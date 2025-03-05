@@ -87,7 +87,7 @@ fn verify_aggregated_signature(
 
     println!("🔍 Verifying aggregated signature for {} public keys", filtered_keys.len());
     println!("📜 Message hash: {:?}", message);
-    println!("🖊️ Aggregated Signature: {:?}", aggregated_signature);
+    //println!("🖊️ Aggregated Signature: {:?}", aggregated_signature);
 
     let result = aggregated_signature.validate() == Ok(());
 
