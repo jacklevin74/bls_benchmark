@@ -2,8 +2,7 @@ use blst::min_pk::{SecretKey, PublicKey, Signature, AggregateSignature};
 use rand::Rng;
 use std::time::Instant;
 use blst::BLST_ERROR;
-
-
+use rand::rng;
 
 /// Struct representing a validator with BLS key pair
 #[derive(Clone)]
@@ -14,10 +13,8 @@ struct Validator {
 
 /// Generate a BLS key pair for a validator
 fn generate_validator() -> Validator {
-#![allow(deprecated)]
-
     let mut ikm = [0u8; 32];
-    rand::thread_rng().fill(&mut ikm); // Random initialization key material (IKM)
+    rng().fill(&mut ikm); // ✅ FIXED: Removed thread_rng()
 
     let secret_key = SecretKey::key_gen(&ikm, &[]).expect("Failed to generate key");
     let public_key = secret_key.sk_to_pk();
@@ -36,7 +33,6 @@ fn hash_message(msg: &str) -> [u8; 32] {
 
 /// Validator signs the block hash
 fn sign_block(secret_key: &SecretKey, message: &[u8; 32]) -> Signature {
-    //println!("Signing message: {:?}", message);
     secret_key.sign(message, &[], &[]) // Signing with domain separation tags set to empty
 }
 
@@ -44,60 +40,73 @@ fn sign_block(secret_key: &SecretKey, message: &[u8; 32]) -> Signature {
 fn verify_signature(public_key: &PublicKey, signature: &Signature, message: &[u8; 32]) -> bool {
     let flag = true;
     signature.verify(
-        flag,      // Group check enabled
-        message,   // Message being verified
-        &[],       // Domain Separation Tag (DST)
-        &[],       // Augmentation input
+        flag,
+        message,
+        &[],
+        &[],
         public_key,
         flag
     ) == BLST_ERROR::BLST_SUCCESS
 }
 
-/// Aggregate multiple signatures based on bitlist filtering
-fn aggregate_signatures(signatures: &[Signature], bitlist: &[bool]) -> Option<AggregateSignature> {
-    let sig_refs: Vec<&Signature> = signatures
-        .iter()
-        .zip(bitlist)
-        .filter_map(|(sig, &include)| if include { Some(sig) } else { None })
-        .collect();
+/// Aggregate multiple signatures
+fn aggregate_signatures<'a>(
+    signatures: &'a [Signature],
+    public_keys: &'a [PublicKey]
+) -> Option<(AggregateSignature, Vec<&'a PublicKey>)> {
+    let sig_refs: Vec<&Signature> = signatures.iter().collect();
+    let filtered_pks: Vec<&PublicKey> = public_keys.iter().collect();
+
+    println!("🔗 Aggregating {} signatures", sig_refs.len());
+    println!("🔑 Using {} public keys in aggregation", filtered_pks.len());
 
     if sig_refs.is_empty() {
+        println!("⚠️ No valid signatures available for aggregation.");
         return None;
     }
 
-    println!("🔗 Aggregating {} signatures", sig_refs.len());
     match AggregateSignature::aggregate(&sig_refs, true) {
-        Ok(agg_sig) => Some(agg_sig),
-        Err(_) => None,
+        Ok(agg_sig) => Some((agg_sig, filtered_pks)),
+        Err(_) => {
+            println!("❌ Failed to aggregate signatures!");
+            None
+        }
     }
 }
 
-/// Verify aggregated signatures using bitlist filtering
+/// Verify aggregated signatures using `fast_aggregate_verify`
 fn verify_aggregated_signature(
-    public_keys: &[PublicKey],
     aggregated_signature: &AggregateSignature,
     message: &[u8; 32],
-    bitlist: &[bool],
+    public_keys: &[&PublicKey],
 ) -> bool {
-    let filtered_keys: Vec<&PublicKey> = public_keys
-        .iter()
-        .zip(bitlist)
-        .filter_map(|(pk, &include)| if include { Some(pk) } else { None })
-        .collect();
-
-    println!("🔍 Verifying aggregated signature for {} public keys", filtered_keys.len());
+    println!("🔍 Verifying aggregated signature for {} public keys", public_keys.len());
     println!("📜 Message hash: {:?}", message);
-    //println!("🖊️ Aggregated Signature: {:?}", aggregated_signature);
 
-    let result = aggregated_signature.validate() == Ok(());
-
-    if result {
-        println!("✅ Aggregated Signature Verification Passed!");
-    } else {
-        println!("❌ Aggregated Signature Verification Failed!");
+    if public_keys.is_empty() {
+        println!("⚠️ No public keys selected for verification.");
+        return false;
     }
 
-    result
+    // Convert AggregateSignature to Signature
+    let signature = Signature::from_aggregate(aggregated_signature);
+
+    let result = signature.fast_aggregate_verify(
+        true,         // Perform subgroup check
+        message,      // Message signed
+        &[],          // ✅ FIXED: Ensuring domain separation is correct
+        public_keys   // Only use the exact subset of signers
+    );
+
+    if result == BLST_ERROR::BLST_SUCCESS {
+        println!("✅ Aggregated Signature Verification Passed!");
+        true
+    } else {
+        println!("❌ Aggregated Signature Verification Failed!");
+        println!("🛠️ DEBUG: Checking mismatches...");
+        println!("🔗 Aggregated Signatures: {}", public_keys.len());
+        return false;
+    }
 }
 
 /// Benchmark function to measure execution time
@@ -118,30 +127,28 @@ fn run_benchmark() {
 
     println!("🖊️ Validators Signing the Block...");
 
-    // Simulating a bitlist where some validators do not sign
-    let bitlist: Vec<bool> = (0..NUM_VALIDATORS).map(|i| i % 50 != 0).collect();
-    //println!("Bitlist: {:?}", bitlist);
-
     let signatures: Vec<Signature> = validators.iter()
-        .enumerate()
-        .filter_map(|(i, v)| if bitlist[i] { Some(sign_block(&v.secret_key, &block_hash)) } else { None })
+        .map(|v| sign_block(&v.secret_key, &block_hash))
         .collect();
 
-    let public_keys: Vec<PublicKey> = validators.iter().map(|v| v.public_key.clone()).collect();
+    let public_keys: Vec<PublicKey> = validators.iter()
+        .map(|v| v.public_key.clone())
+        .collect();
 
     println!("⏳ Benchmarking Non-Aggregated Signature Verification...");
     benchmark("🔍 Non-Aggregated Verification", || {
-        for (i, sig) in signatures.iter().enumerate() {
-            if bitlist[i] {
-                verify_signature(&validators[i].public_key, sig, &block_hash);
-            }
+        for (pk, sig) in public_keys.iter().zip(signatures.iter()) {
+            verify_signature(pk, sig, &block_hash);
         }
     });
 
     println!("⏳ Benchmarking Aggregated Signature Verification...");
-    if let Some(aggregated_signature) = aggregate_signatures(&signatures, &bitlist) {
-        benchmark("🔍 Aggregated Verification (Bitlist Optimized)", || {
-            verify_aggregated_signature(&public_keys, &aggregated_signature, &block_hash, &bitlist);
+    if let Some((aggregated_signature, filtered_keys)) = aggregate_signatures(&signatures, &public_keys) {
+        benchmark("🔍 Aggregated Verification", || {
+            let result = verify_aggregated_signature(&aggregated_signature, &block_hash, &filtered_keys);
+            if !result {
+                println!("❌ DEBUG: Aggregated verification failed!");
+            }
         });
     } else {
         println!("❌ No valid signatures available for aggregation.");
